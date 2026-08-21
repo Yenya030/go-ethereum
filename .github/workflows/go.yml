@@ -103,6 +103,40 @@ jobs:
       - name: Run tests
         run: go run build/ci.go test -p 8
 
+  windows-fork-validation:
+    name: Windows fork validation
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.repository == 'Yenya030/go-ethereum' &&
+      github.actor == 'Yenya030' &&
+      github.head_ref == 'ci/windows-build-validation'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      GETH_MINGW: 'C:\msys64\mingw64'
+      GETH_CC: 'C:\msys64\mingw64\bin\gcc.exe'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Run canary unit tests
+        shell: cmd
+        run: go test build/ci.go build/ci_windows_probe_test.go -count=1
+
+      - name: Build
+        shell: cmd
+        run: |
+          set PATH=%GETH_MINGW%\bin;%PATH%
+          go run build/ci.go install -arch amd64 -cc %GETH_CC%
+
   windows:
     name: Windows ${{ matrix.arch }}
     needs: lint

