@@ -114,8 +114,8 @@ jobs:
     permissions:
       contents: read
     env:
-      GETH_MINGW: 'C:\msys64\mingw64'
-      GETH_CC: 'C:\msys64\mingw64\bin\gcc.exe'
+      GETH_MINGW: 'C:\mingw64'
+      GETH_CC: 'C:\mingw64\bin\gcc.exe'
     steps:
       - uses: actions/checkout@v4
         with:
